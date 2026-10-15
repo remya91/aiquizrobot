@@ -54,6 +54,7 @@ function Index() {
   const [answers, setAnswers] = useState<Answer[]>([]);
   const recRef = useRef<any>(null);
   const listeningRef = useRef(false);
+  const committedRef = useRef(0);
   const genQuiz = useServerFn(generateQuiz);
 
   useEffect(() => {
