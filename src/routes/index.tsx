@@ -54,6 +54,7 @@ function Index() {
   const [answers, setAnswers] = useState<Answer[]>([]);
   const recRef = useRef<any>(null);
   const listeningRef = useRef(false);
+  const committedRef = useRef(0);
   const genQuiz = useServerFn(generateQuiz);
 
   useEffect(() => {
@@ -75,11 +76,18 @@ function Index() {
     }
     const rec = new SR();
     rec.continuous = true; rec.interimResults = true; rec.lang = "en-US";
+    committedRef.current = 0;
     rec.onresult = (e: any) => {
+      // Android Chrome re-fires onresult with results already seen (stale
+      // resultIndex, repeated finals/interims). Only commit finals whose
+      // index we haven't processed yet; rebuild interim from uncommitted
+      // non-final results so temporary text never gets appended twice.
       let fin = ""; let int = "";
-      for (let i = e.resultIndex; i < e.results.length; i++) {
+      for (let i = 0; i < e.results.length; i++) {
+        if (i < committedRef.current) continue;
         const r = e.results[i];
-        if (r.isFinal) fin += r[0].transcript + " "; else int += r[0].transcript;
+        if (r.isFinal) { fin += r[0].transcript + " "; committedRef.current = i + 1; }
+        else int += r[0].transcript;
       }
       if (fin) setTranscript((t) => (t + " " + fin).replace(/\s+/g, " ").trimStart());
       setInterim(int);
@@ -87,12 +95,16 @@ function Index() {
     rec.onerror = (e: any) => {
       if (e.error === "not-allowed") { setManual(true); setError("Microphone permission was denied. Please type the lesson instead."); listeningRef.current = false; setPhase("ready"); }
     };
-    rec.onend = () => { if (listeningRef.current) { try { rec.start(); } catch {} } };
+    rec.onend = () => {
+      // Auto-restart keeps the same result list on Android, so committedRef
+      // must NOT be reset here — resetting would re-append everything.
+      if (listeningRef.current) { try { rec.start(); } catch {} }
+    };
     recRef.current = rec; listeningRef.current = true; setDemo(false);
     rec.start(); setPhase("listening");
   };
 
-  const stopRec = () => { listeningRef.current = false; recRef.current?.stop(); setInterim(""); };
+  const stopRec = () => { listeningRef.current = false; committedRef.current = 0; recRef.current?.stop(); setInterim(""); };
 
   const createQuiz = async () => {
     stopRec();
