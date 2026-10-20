@@ -1,7 +1,7 @@
 import { createFileRoute } from "@tanstack/react-router";
 import { useEffect, useRef, useState } from "react";
 import { useServerFn } from "@tanstack/react-start";
-import { Mic, Square, Trash2, Sparkles, HelpCircle, Volume2, RotateCcw, BookOpen, Check, X, Keyboard } from "lucide-react";
+import { Mic, MicOff, Square, Trash2, Sparkles, HelpCircle, Volume2, RotateCcw, BookOpen, Check, X, Keyboard } from "lucide-react";
 import robot from "@/assets/robot.png";
 import { generateQuiz, getHelp, type QuizQuestion, type HelpData } from "@/lib/quiz.functions";
 
@@ -33,6 +33,29 @@ const DEMO_HELP: HelpData = { explanation: "Plants are like little kitchens! The
 type Phase = "ready" | "listening" | "processing" | "quiz" | "results";
 type Answer = { correct: boolean };
 
+// Consecutive recognition sessions that end without hearing anything before we stop auto-restarting.
+const NO_SPEECH_LIMIT = 5;
+
+const MIC_DENIED = "Microphone permission was denied. Allow the microphone for this site (tap the icon next to the web address), or type the lesson instead.";
+const MIC_MISSING = "I couldn't find a working microphone. Close other apps using the mic and try again, or type the lesson instead.";
+
+const MIC_ERRORS: Record<string, string> = {
+  "not-allowed": MIC_DENIED,
+  "service-not-allowed": "Speech recognition is turned off on this device. Make sure Google voice typing is enabled, or type the lesson instead.",
+  "audio-capture": MIC_MISSING,
+  network: "Speech recognition needs an internet connection. Check your connection and try again, or type the lesson instead.",
+  "language-not-supported": "English speech recognition isn't available on this device. Please type the lesson instead.",
+};
+
+const NO_SERVICE = "Speech recognition couldn't start on this device. Make sure the Google app and Google voice typing are installed and turned on, then try again, or type the lesson instead.";
+
+// Android tablets often run Chrome in "desktop site" mode, which hides "Android" from the user agent.
+function isAndroidDevice() {
+  if ((navigator as any).userAgentData?.platform === "Android") return true;
+  const ua = navigator.userAgent;
+  return /Android/i.test(ua) || (/Linux/i.test(ua) && !/CrOS/i.test(ua) && navigator.maxTouchPoints > 0);
+}
+
 function speak(text: string) {
   if (typeof window === "undefined" || !("speechSynthesis" in window)) return;
   window.speechSynthesis.cancel();
@@ -52,59 +75,139 @@ function Index() {
   const [questions, setQuestions] = useState<QuizQuestion[]>([]);
   const [idx, setIdx] = useState(0);
   const [answers, setAnswers] = useState<Answer[]>([]);
+  const [micReady, setMicReady] = useState(false);
+  const [askingMic, setAskingMic] = useState(false);
   const recRef = useRef<any>(null);
+  const sessionRef = useRef(0);
   const listeningRef = useRef(false);
   const committedRef = useRef(0);
+  const restartRef = useRef<number | undefined>(undefined);
+  const micPermRef = useRef<string>("prompt");
+  const boxRef = useRef<HTMLDivElement>(null);
   const genQuiz = useServerFn(generateQuiz);
 
   useEffect(() => {
     const SR = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
-    if (!SR) { setSupported(false); setManual(true); }
+    if (!SR) {
+      setSupported(false); setManual(true);
+      setError("This browser can't listen to speech. Please open the page in Google Chrome, or type the lesson / use the Demo lesson.");
+      return;
+    }
+    navigator.permissions?.query({ name: "microphone" as PermissionName }).then((p) => {
+      micPermRef.current = p.state;
+      p.onchange = () => { micPermRef.current = p.state; };
+    }).catch(() => {});
+    return () => { listeningRef.current = false; clearTimeout(restartRef.current); try { recRef.current?.abort(); } catch {} };
   }, []);
 
-  const start = async () => {
+  useEffect(() => { const el = boxRef.current; if (el) el.scrollTop = el.scrollHeight; }, [transcript, interim]);
+
+  const start = () => {
+    if (listeningRef.current) return;
     setError(null);
     const SR = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
     if (!SR) { setSupported(false); setManual(true); setError("Your browser can't listen. Please type the lesson below instead."); return; }
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    if (!window.isSecureContext) { setManual(true); setError("The microphone only works on a secure (https://) page. Please open the website using https, or type the lesson instead."); return; }
+    if (micPermRef.current === "denied") { setManual(true); setError(MIC_DENIED); return; }
+
+    listeningRef.current = true; setDemo(false); setMicReady(false); setPhase("listening");
+    const session = ++sessionRef.current;
+    if (micPermRef.current === "granted" || !navigator.mediaDevices?.getUserMedia) { listen(SR); return; }
+
+    // Android Chrome ends or rejects a recognition session while its permission prompt is
+    // still open, so get the permission first and only then start recognition.
+    setAskingMic(true);
+    navigator.mediaDevices.getUserMedia({ audio: true }).then((stream) => {
       stream.getTracks().forEach((t) => t.stop());
-    } catch {
-      setManual(true);
-      setError("I can't hear you — microphone permission was denied. You can type the lesson instead.");
-      return;
-    }
+      micPermRef.current = "granted";
+      if (sessionRef.current !== session) return;
+      setAskingMic(false);
+      // Android needs a moment to release the mic before recognition can open it.
+      restartRef.current = window.setTimeout(() => { if (sessionRef.current === session) listen(SR); }, 300);
+    }, (err: DOMException) => {
+      if (sessionRef.current !== session) return;
+      listeningRef.current = false; setAskingMic(false); setManual(true); setPhase("ready");
+      setError(err?.name === "NotAllowedError" || err?.name === "SecurityError" ? MIC_DENIED
+        : err?.name === "NotFoundError" || err?.name === "NotReadableError" ? MIC_MISSING
+        : "I couldn't open the microphone. Please try again, or type the lesson instead.");
+    });
+  };
+
+  const listen = (SR: any) => {
+    try { recRef.current?.abort(); } catch {}
     const rec = new SR();
-    rec.continuous = true; rec.interimResults = true; rec.lang = "en-US";
-    committedRef.current = 0;
+    // Android ends a session after every phrase and duplicates results in continuous mode,
+    // so there we run one phrase per session and restart on end.
+    rec.continuous = !isAndroidDevice(); rec.interimResults = true; rec.lang = "en-US";
+    let lastFinal = ""; let heard = false; let started = false; let emptySessions = 0; let failed = false;
+
+    // Every session starts a fresh results list, so the committed index resets with it.
+    const begin = () => { committedRef.current = 0; lastFinal = ""; heard = false; started = false; rec.start(); };
+    const fail = (msg: string) => {
+      failed = true; listeningRef.current = false; clearTimeout(restartRef.current);
+      setMicReady(false); setInterim(""); setManual(true); setError(msg); setPhase("ready");
+    };
+
+    rec.onstart = () => { if (recRef.current !== rec) return; started = true; setMicReady(true); };
     rec.onresult = (e: any) => {
-      // Android Chrome re-fires onresult with results already seen (stale
-      // resultIndex, repeated finals/interims). Only commit finals whose
-      // index we haven't processed yet; rebuild interim from uncommitted
-      // non-final results so temporary text never gets appended twice.
+      if (recRef.current !== rec) return;
+      // Only commit finals whose index we haven't processed yet; Android may also
+      // repeat a final or send it cumulatively, so skip/trim text already committed.
       let fin = ""; let int = "";
-      for (let i = 0; i < e.results.length; i++) {
-        if (i < committedRef.current) continue;
+      for (let i = committedRef.current; i < e.results.length; i++) {
         const r = e.results[i];
-        if (r.isFinal) { fin += r[0].transcript + " "; committedRef.current = i + 1; }
-        else int += r[0].transcript;
+        if (r.isFinal) {
+          committedRef.current = i + 1;
+          const text = r[0].transcript.trim();
+          const norm = text.toLowerCase();
+          if (!norm || norm === lastFinal) continue;
+          fin += (lastFinal && norm.startsWith(lastFinal) ? text.slice(lastFinal.length) : text) + " ";
+          lastFinal = norm;
+        } else int += r[0].transcript;
       }
+      if (fin || int) heard = true;
       if (fin) setTranscript((t) => (t + " " + fin).replace(/\s+/g, " ").trimStart());
       setInterim(int);
     };
     rec.onerror = (e: any) => {
-      if (e.error === "not-allowed") { setManual(true); setError("Microphone permission was denied. Please type the lesson instead."); listeningRef.current = false; setPhase("ready"); }
+      if (recRef.current !== rec || !listeningRef.current) return;
+      if (e.error === "no-speech" || e.error === "aborted") return;
+      fail(MIC_ERRORS[e.error] ?? "Something went wrong while listening. Please try again, or type the lesson instead.");
     };
     rec.onend = () => {
-      // Auto-restart keeps the same result list on Android, so committedRef
-      // must NOT be reset here — resetting would re-append everything.
-      if (listeningRef.current) { try { rec.start(); } catch {} }
+      if (recRef.current !== rec) return;
+      setInterim("");
+      if (!listeningRef.current || failed) return;
+      // A session that ends without ever starting won't start on a retry either.
+      if (!started && !heard) { fail(NO_SERVICE); return; }
+      emptySessions = heard ? 0 : emptySessions + 1;
+      if (emptySessions >= NO_SPEECH_LIMIT) {
+        listeningRef.current = false; setMicReady(false); setPhase("ready");
+        setError("I stopped listening because I couldn't hear anything. Tap START LISTENING to try again.");
+        return;
+      }
+      restartRef.current = window.setTimeout(() => {
+        if (recRef.current !== rec || !listeningRef.current) return;
+        try { begin(); } catch { fail("I couldn't keep listening. Tap START LISTENING to try again, or type the lesson instead."); }
+      }, 250);
     };
-    recRef.current = rec; listeningRef.current = true; setDemo(false);
-    rec.start(); setPhase("listening");
+
+    recRef.current = rec;
+    try { begin(); } catch {
+      listeningRef.current = false; recRef.current = null; setPhase("ready");
+      setError("I couldn't start the microphone. Please try again, or type the lesson instead.");
+    }
   };
 
-  const stopRec = () => { listeningRef.current = false; committedRef.current = 0; recRef.current?.stop(); setInterim(""); };
+  // committedRef is left alone: Chrome delivers the session's last finals after stop(),
+  // and resetting it would re-append everything already in the transcript.
+  const stopRec = () => {
+    listeningRef.current = false; sessionRef.current++; clearTimeout(restartRef.current);
+    try { recRef.current?.stop(); } catch {}
+    setInterim(""); setMicReady(false); setAskingMic(false);
+  };
+
+  const stopListening = () => { stopRec(); setPhase("ready"); };
 
   const createQuiz = async () => {
     stopRec();
@@ -137,36 +240,41 @@ function Index() {
 
   const status: Record<Phase, string> = {
     ready: "Robot is ready! 🤖",
-    listening: "Robot is listening...",
+    listening: askingMic ? "Please allow the microphone 🎤" : micReady ? "Robot is listening..." : "Getting the microphone ready...",
     processing: "Great! I understood the lesson. Let me prepare your quiz!",
     quiz: `Question ${idx + 1} of ${questions.length}`,
     results: "Quiz complete!",
   };
 
   return (
-    <main className="mx-auto max-w-4xl px-4 py-6 sm:py-10">
-      <header className="text-center">
+    <main className="mx-auto max-w-4xl px-4 py-6 sm:py-10 short:py-3">
+      <header className="text-center short:flex short:items-center short:justify-center short:gap-4 short:text-left">
         <img src={robot} alt="Friendly robot mascot" width={1024} height={1024}
-          className={`mx-auto h-36 w-36 sm:h-44 sm:w-44 ${phase === "listening" || phase === "processing" ? "animate-floaty" : ""}`} />
-        <h1 className="mt-2 text-3xl font-bold text-primary sm:text-5xl">AI Classroom Listening Robot</h1>
-        <p className="mt-2 text-lg font-semibold text-secondary sm:text-xl">Your teacher teaches. I listen. Then we play a quiz!</p>
-        <div className="mt-4 inline-flex items-center gap-2 rounded-full bg-card px-5 py-2 font-bold shadow-card" role="status" aria-live="polite">
-          {demo && <span className="rounded-full bg-sunny px-2 py-0.5 text-xs text-sunny-foreground">DEMO MODE</span>}
-          {status[phase]}
+          className={`mx-auto h-36 w-36 sm:h-44 sm:w-44 short:mx-0 short:h-24 short:w-24 short:shrink-0 ${phase === "listening" || phase === "processing" ? "animate-floaty" : ""}`} />
+        <div>
+          <h1 className="mt-2 text-3xl font-bold text-primary sm:text-5xl short:mt-0 short:text-3xl">AI Classroom Listening Robot</h1>
+          <p className="mt-2 text-lg font-semibold text-secondary sm:text-xl short:mt-1 short:text-base">Your teacher teaches. I listen. Then we play a quiz!</p>
+          <div className="mt-4 inline-flex items-center gap-2 rounded-full bg-card px-5 py-2 font-bold shadow-card short:mt-2" role="status" aria-live="polite">
+            {demo && <span className="rounded-full bg-sunny px-2 py-0.5 text-xs text-sunny-foreground">DEMO MODE</span>}
+            {status[phase]}
+          </div>
         </div>
       </header>
 
       {error && (
-        <div className="mt-5 rounded-2xl border-2 border-destructive/40 bg-card p-4 text-center font-semibold text-destructive">{error}</div>
+        <div role="alert" className="mt-5 rounded-2xl border-2 border-destructive/40 bg-card p-4 text-center font-semibold text-destructive short:mt-3">⚠️ {error}</div>
       )}
 
       {(phase === "ready" || phase === "listening") && (
-        <section className="mt-6 space-y-5">
+        <section className="mt-6 space-y-5 short:mt-3 short:space-y-3">
           <div className="flex flex-wrap justify-center gap-3">
             {phase === "ready" ? (
               <BigBtn onClick={start} tone="primary" disabled={!supported}><Mic className="h-7 w-7" /> START LISTENING</BigBtn>
             ) : (
-              <BigBtn onClick={createQuiz} tone="sunny"><Square className="h-6 w-6" /> STOP &amp; CREATE QUIZ</BigBtn>
+              <>
+                <BigBtn onClick={stopListening} tone="primary"><MicOff className="h-6 w-6" /> STOP LISTENING</BigBtn>
+                <BigBtn onClick={createQuiz} tone="sunny"><Square className="h-6 w-6" /> STOP &amp; CREATE QUIZ</BigBtn>
+              </>
             )}
             {phase === "ready" && transcript.trim() && (
               <BigBtn onClick={createQuiz} tone="sunny"><Sparkles className="h-6 w-6" /> CREATE QUIZ</BigBtn>
@@ -174,17 +282,17 @@ function Index() {
           </div>
 
           {phase === "listening" && (
-            <div className="flex h-16 items-center justify-center gap-1.5" aria-hidden>
+            <div className="flex h-16 items-center justify-center gap-1.5 short:h-10" aria-hidden>
               {Array.from({ length: 12 }).map((_, i) => (
                 <span key={i} className="h-full w-2.5 origin-center rounded-full bg-secondary animate-wave" style={{ animationDelay: `${(i % 6) * 0.12}s` }} />
               ))}
             </div>
           )}
 
-          <div className="rounded-3xl bg-card p-5 shadow-card">
+          <div className="rounded-3xl bg-card p-5 shadow-card short:p-4">
             <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
               <h2 className="flex items-center gap-2 text-xl font-semibold"><BookOpen className="h-5 w-5 text-primary" /> Lesson transcript</h2>
-              <div className="flex flex-wrap gap-2">
+              <div className="flex flex-wrap gap-2 sm:touch:gap-3">
                 <SmallBtn onClick={() => setManual((m) => !m)}><Keyboard className="h-4 w-4" /> {manual ? "Lock text" : "Type / edit"}</SmallBtn>
                 <SmallBtn onClick={() => { setTranscript(""); setInterim(""); setDemo(false); }}><Trash2 className="h-4 w-4" /> CLEAR TRANSCRIPT</SmallBtn>
                 <SmallBtn onClick={loadDemo}><Sparkles className="h-4 w-4" /> Demo lesson</SmallBtn>
@@ -193,9 +301,9 @@ function Index() {
             {manual ? (
               <textarea value={transcript} onChange={(e) => { setTranscript(e.target.value); setDemo(false); }}
                 placeholder="Type or paste the teacher's lesson here..."
-                className="min-h-48 w-full rounded-2xl border-2 bg-muted p-4 text-lg outline-none focus:border-primary" />
+                className="min-h-48 max-h-[60dvh] w-full rounded-2xl border-2 bg-muted p-4 text-lg outline-none focus:border-primary short:min-h-32 tall:min-h-[36dvh]" />
             ) : (
-              <div className="min-h-48 rounded-2xl bg-muted p-4 text-lg leading-relaxed">
+              <div ref={boxRef} className="min-h-48 max-h-[50dvh] overflow-y-auto overscroll-contain rounded-2xl bg-muted p-4 text-lg leading-relaxed short:min-h-32 tall:min-h-[36dvh]">
                 {transcript || interim ? (<>{transcript} <span className="text-muted-foreground">{interim}</span></>) : (
                   <span className="text-muted-foreground">The teacher's words will appear here while I listen...</span>
                 )}
@@ -386,7 +494,7 @@ function BigBtn({ children, onClick, tone, disabled }: { children: React.ReactNo
   const c = tone === "primary" ? "bg-primary text-primary-foreground" : "bg-sunny text-sunny-foreground";
   return (
     <button onClick={onClick} disabled={disabled}
-      className={`inline-flex items-center gap-3 rounded-full px-7 py-4 font-display text-xl font-semibold shadow-pop transition-transform hover:-translate-y-0.5 active:translate-y-0.5 disabled:opacity-50 sm:text-2xl ${c}`}>
+      className={`inline-flex touch-manipulation select-none items-center justify-center gap-3 rounded-full px-7 py-4 font-display text-xl font-semibold shadow-pop transition-transform hover:-translate-y-0.5 active:translate-y-0.5 disabled:opacity-50 sm:text-2xl short:py-3 short:text-xl ${c}`}>
       {children}
     </button>
   );
@@ -394,7 +502,7 @@ function BigBtn({ children, onClick, tone, disabled }: { children: React.ReactNo
 
 function SmallBtn({ children, onClick }: { children: React.ReactNode; onClick: () => void }) {
   return (
-    <button onClick={onClick} className="inline-flex items-center gap-1.5 rounded-full bg-accent px-3 py-1.5 text-sm font-bold text-accent-foreground hover:opacity-90">
+    <button onClick={onClick} className="inline-flex touch-manipulation select-none items-center gap-1.5 rounded-full bg-accent px-3 py-1.5 text-sm font-bold text-accent-foreground hover:opacity-90 touch:min-h-11 sm:touch:px-4 sm:touch:text-base">
       {children}
     </button>
   );

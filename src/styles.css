@@ -3,6 +3,10 @@
 @import "tw-animate-css";
 
 @custom-variant dark (&:is(.dark *));
+/* Touch-only so laptop (fine pointer) layouts stay unchanged. */
+@custom-variant touch (@media (pointer: coarse));
+@custom-variant short (@media (pointer: coarse) and (orientation: landscape) and (max-height: 640px));
+@custom-variant tall (@media (pointer: coarse) and (orientation: portrait) and (min-height: 900px));
 
 @theme inline {
   --font-sans: "Nunito", system-ui, sans-serif;
